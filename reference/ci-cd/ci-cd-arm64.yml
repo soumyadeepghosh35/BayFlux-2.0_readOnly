@@ -1,0 +1,101 @@
+name: CI/CD arm64 (main to Docker Hub dev-arm64)
+
+# Builds the native linux/arm64 image from mac_arm64/ under QEMU emulation,
+# runs pytest inside it, and only then updates
+#   <dockerhub-user>/<image>:dev-arm64            newest tested build of main
+#   <dockerhub-user>/<image>:dev-arm64-previous   the dev-arm64 image from before the last update
+# Release tags (2.0-arm64) and latest-arm64 are never touched here.
+on:
+  push:
+    branches: [main]
+    # Documentation-only changes do not rebuild the image. Changes under
+    # mac_arm64/ do trigger a build, except its validation logs.
+    paths-ignore:
+      - "mac_arm64/validation/**"
+      - "docs/**"
+      - "release/**"
+      - "**/*.md"
+      - ".github/workflows/ci-cd.yml"
+
+env:
+  IMAGE: <dockerhub-user>/<image>
+
+# A separate group from ci-cd-amd64, so the two workflows never cancel each other.
+concurrency:
+  group: ci-cd-arm64
+  cancel-in-progress: true
+
+jobs:
+  test-build-publish:
+    # QEMU emulation on an amd64 runner. A native arm64 runner was not used.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # mac_arm64/Dockerfile does COPY src/ /bayflux/, and mac_arm64/src/ is not
+      # tracked in git. Rebuild it from the repository root. The x86 emusFortran
+      # module is left out because the ARM Dockerfile compiles it from source.
+      # The committed example outputs are left out as in the earlier ARM image.
+      - name: Prepare build context
+        run: |
+          mkdir -p mac_arm64/src
+          rsync -a \
+            --exclude=/.git --exclude=/.github --exclude=/mac_arm64 \
+            --exclude='/emusFortran.cpython-310-x86_64-linux-gnu.so' \
+            --exclude='/command_line_example/**/outputdata' \
+            --exclude='/command_line_example/**/outputData' \
+            ./ mac_arm64/src/
+          ls mac_arm64/src
+          df -h /
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # No setup-buildx-action, as in the amd64 workflow. Built locally, not
+      # pushed. The tests live inside the image.
+      - name: Build image (not pushed yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: mac_arm64
+          file: mac_arm64/Dockerfile
+          platforms: linux/arm64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:dev-arm64
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Disk after build
+        if: always()
+        run: df -h /
+
+      # A non-zero exit stops the job, so nothing below runs on a failing build.
+      # The image provides python3 only, not python.
+      - name: Run test suite
+        run: |
+          docker run --rm --platform linux/arm64 --shm-size=4g "$IMAGE:dev-arm64" \
+            bash -c "cd /bayflux && python3 -m pytest tests -q"
+
+      # Copy the current dev-arm64 image to dev-arm64-previous on Docker Hub (a
+      # registry-side retag, nothing is pulled), then replace dev-arm64. The
+      # "no existing tag" message is expected on the first run.
+      - name: Back up current dev-arm64, then push new dev-arm64
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:dev-arm64" > /dev/null 2>&1; then
+            docker buildx imagetools create -t "$IMAGE:dev-arm64-previous" "$IMAGE:dev-arm64"
+          else
+            echo "No existing dev-arm64 tag, nothing to back up"
+          fi
+          docker push "$IMAGE:dev-arm64"
+          docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:dev-arm64"
